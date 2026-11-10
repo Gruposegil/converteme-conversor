@@ -223,6 +223,62 @@ class TesteConversor(unittest.TestCase):
         finally:
             shutil.rmtree(pasta, ignore_errors=True)
 
+    def test_pdf_para_excel_relatorio(self):
+        """Relatório em colunas (inventado) vira planilha: cada campo na sua coluna, em todas as
+        páginas; data é data, número é número, código com zero à esquerda continua texto."""
+        import datetime
+        from openpyxl import load_workbook
+        st, xlsx, h = self.pedir(relatorio_exemplo(), "xlsx")
+        self.assertEqual(st, 200, xlsx[:300])
+        self.assertEqual(h["Content-Type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.assertEqual(h["X-Modo"], "planilha")
+        ws = load_workbook(io.BytesIO(xlsx)).active
+        linhas = [r for r in ws.iter_rows(values_only=True)]
+        func = [r for r in linhas if any(isinstance(v, str) and v.startswith("FUNCIONARIO INVENTADO") for v in r)]
+        self.assertGreater(len(func), 30, "todas as páginas")
+        col_nome = {r.index(next(v for v in r if isinstance(v, str) and v.startswith("FUNCIONARIO"))) for r in func}
+        self.assertEqual(len(col_nome), 1, "o nome fica sempre na mesma coluna")
+        primeira = func[0]
+        self.assertEqual(primeira[0], "000001", "código com zero à esquerda é texto")
+        datas = [v for v in primeira if isinstance(v, datetime.datetime)]
+        self.assertEqual(len(datas), 3, "as três datas viram data")
+        col_data = {r.index(next(v for v in r if isinstance(v, datetime.datetime))) for r in func}
+        self.assertEqual(len(col_data), 1, "a primeira data fica sempre na mesma coluna")
+        self.assertIn(30, [v for r in linhas for v in r], "número vira número")
+
+    def test_pdf_para_excel_tabela_com_grade(self):
+        """Tabela com bordas (Word -> PDF -> Excel): as células da tabela viram células; R$ vira número."""
+        from openpyxl import load_workbook
+        st, pdf, _ = self.pedir(docx_exemplo(), "pdf", ext=".docx")
+        self.assertEqual(st, 200)
+        st, xlsx, h = self.pedir(pdf, "xlsx")
+        self.assertEqual(st, 200, xlsx[:300])
+        wb = load_workbook(io.BytesIO(xlsx))
+        ws = wb.active
+        celulas = {(c.row, c.column): c for r in ws.iter_rows() for c in r if c.value is not None}
+        servico = next(c for c in celulas.values() if c.value == "Serviço")
+        valor = celulas[(servico.row, servico.column + 1)]
+        self.assertEqual(valor.value, 1234.56)
+        self.assertIn("R$", valor.number_format)
+        item = next(c for c in celulas.values() if c.value == "Item")
+        self.assertEqual(celulas[(item.row, item.column + 1)].value, "Valor")
+        self.assertEqual(item.column, servico.column, "mesma coluna da tabela")
+
+    def test_valores_brasileiros(self):
+        sys.path.insert(0, os.path.join(AQUI, ".."))
+        import datetime
+        import planilha
+        self.assertEqual(planilha.valor("008897"), ("008897", None))
+        self.assertEqual(planilha.valor("40170029000136")[0], "40170029000136")
+        self.assertEqual(planilha.valor("123.456.789-09")[0], "123.456.789-09")
+        self.assertEqual(planilha.valor("1.234,56"), (1234.56, "#,##0.00"))
+        self.assertEqual(planilha.valor("R$ 1.234,56")[0], 1234.56)
+        self.assertEqual(planilha.valor("-12,5%")[0], -0.125)
+        self.assertEqual(planilha.valor("0"), (0, None))
+        self.assertEqual(planilha.valor("30"), (30, None))
+        self.assertEqual(planilha.valor("01/10/2020")[0], datetime.datetime(2020, 10, 1))
+        self.assertEqual(planilha.valor("31/02/2020")[0], "31/02/2020", "data que não existe fica texto")
+
     def test_excel_para_pdf(self):
         st, pdf, _ = self.pedir(xlsx_exemplo(), "pdf", ext=".xlsx")
         self.assertEqual(st, 200, pdf[:300])

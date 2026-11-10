@@ -6,6 +6,7 @@ O que faz:
                               Relatório em colunas (ou se a detalhada travar ou falhar): conversão
                               "no lugar" (layout.py), cada linha na mesma posição do PDF.
                               O cabeçalho X-Modo diz qual foi: completo, posicao ou simples.
+  POST /converter?para=xlsx   PDF  -> Excel (.xlsx), com planilha.py (tabelas com grade e relatórios em colunas)
   POST /converter?para=pdf    Word, Excel, PowerPoint, OpenDocument, RTF -> PDF, com LibreOffice (MPL)
   GET  /saude                 "ok" (para o Cloud Run saber que está de pé)
 
@@ -40,6 +41,7 @@ MAX_PAGINAS = int(os.environ.get("MAX_PAGINAS", "300"))
 # PDF -> Word: até 75 s na detalhada + poucos segundos na "no lugar"; Office -> PDF: até 85 s
 PRAZO = int(os.environ.get("PRAZO_SEGUNDOS", "85"))
 PRAZO_DOCX = int(os.environ.get("PRAZO_DOCX_SEGUNDOS", "75"))      # conversão detalhada de PDF para Word
+PRAZO_XLSX = int(os.environ.get("PRAZO_XLSX_SEGUNDOS", "85"))      # PDF para Excel
 MEMORIA_DOCX_MB = int(os.environ.get("MEMORIA_DOCX_MB", "900"))    # teto de memória de cada processo da detalhada (0 = sem teto)
 # processos da conversão detalhada (no Cloud Run com 2 CPUs, 2 processos levam quase metade do tempo)
 PROCESSOS_DOCX = max(1, min(int(os.environ.get("PROCESSOS_DOCX", "2")), len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 1))
@@ -48,6 +50,7 @@ SOFFICE = os.environ.get("SOFFICE", shutil.which("soffice") or "soffice")
 TIPOS_SAIDA = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 # uma conversão do LibreOffice por vez em cada cópia do servidor (ele não gosta de concorrência)
 TRAVA_LO = threading.Lock()
@@ -211,9 +214,7 @@ def _rodar_com_prazo(cmd, prazo):
         raise
 
 
-def pdf_para_docx(pasta: str, entrada: str):
-    """Devolve (caminho, modo). modo = "completo" (pdf2docx), "posicao" (layout.py: cada linha
-    no mesmo lugar) ou "simples" (texto corrido, último recurso)."""
+def _conferir_pdf(entrada: str) -> None:
     import pymupdf as fitz  # PyMuPDF
     with fitz.open(entrada) as d:
         if d.needs_pass:
@@ -222,6 +223,25 @@ def pdf_para_docx(pasta: str, entrada: str):
             raise Problema(413, "paginas", f"Este PDF tem {d.page_count} páginas. O limite é {MAX_PAGINAS}.")
         if d.page_count == 0:
             raise Problema(422, "vazio", "Este PDF não tem páginas.")
+
+
+def pdf_para_xlsx(pasta: str, entrada: str) -> str:
+    """PDF -> Excel (planilha.py), num processo separado com prazo e teto de memória."""
+    _conferir_pdf(entrada)
+    saida = os.path.join(pasta, "saida.xlsx")
+    try:
+        rc = _rodar_com_prazo([sys.executable, os.path.abspath(__file__), "--planilha", entrada, saida], PRAZO_XLSX)
+    except subprocess.TimeoutExpired:
+        raise Problema(504, "demorou", "Este PDF é complexo demais para virar planilha. Tente dividir em partes menores no Dividir PDF.")
+    if rc != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
+        raise Problema(422, "nao-converteu", "Não consegui transformar este PDF em planilha. Ele pode estar danificado.")
+    return saida
+
+
+def pdf_para_docx(pasta: str, entrada: str):
+    """Devolve (caminho, modo). modo = "completo" (pdf2docx), "posicao" (layout.py: cada linha
+    no mesmo lugar) ou "simples" (texto corrido, último recurso)."""
+    _conferir_pdf(entrada)
     saida = os.path.join(pasta, "saida.docx")
     try:
         relatorio = parece_relatorio(entrada)
@@ -279,6 +299,10 @@ def converter(dados: bytes, para: str, nome_ext: str):
             if tipo != "pdf":
                 raise Problema(415, "tipo", "Para converter em Word, envie um PDF.")
             caminho, modo = pdf_para_docx(pasta, entrada)
+        elif para == "xlsx":
+            if tipo != "pdf":
+                raise Problema(415, "tipo", "Para converter em Excel, envie um PDF.")
+            caminho, modo = pdf_para_xlsx(pasta, entrada), "planilha"
         elif para == "pdf":
             if tipo in ("pdf", "desconhecido"):
                 raise Problema(415, "tipo", "Envie um arquivo do Word, Excel, PowerPoint ou OpenDocument.")
@@ -367,5 +391,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--pdf2docx":
         _pdf2docx_filho(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "--planilha":
+        import planilha
+        planilha.converter(sys.argv[2], sys.argv[3])
     else:
         main()

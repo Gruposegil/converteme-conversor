@@ -5,7 +5,8 @@ ferramentas que não dá para fazer no navegador:
 
 | Ferramenta | Como |
 | --- | --- |
-| PDF para Word (.docx) | [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) (MIT) + [PyMuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0) |
+| PDF para Word (.docx) | [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) (MIT) + [PyMuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0); relatórios em colunas com `layout.py` (próprio) |
+| PDF para Excel (.xlsx) | `planilha.py` (próprio) com PyMuPDF e [openpyxl](https://foss.heptapod.net/openpyxl/openpyxl) (MIT) |
 | Excel, PowerPoint, Word, OpenDocument para PDF | [LibreOffice](https://www.libreoffice.org/) (MPL-2.0), sem interface |
 
 Roda no **Google Cloud Run, região São Paulo** (`southamerica-east1`).
@@ -25,6 +26,7 @@ Roda no **Google Cloud Run, região São Paulo** (`southamerica-east1`).
 | --- | --- | --- |
 | GET | `/saude` | responde `ok` |
 | POST | `/converter?para=docx` | corpo = PDF → devolve .docx |
+| POST | `/converter?para=xlsx` | corpo = PDF → devolve .xlsx |
 | POST | `/converter?para=pdf&ext=.xlsx` | corpo = Word/Excel/PowerPoint/OpenDocument → devolve PDF |
 
 Cabeçalho obrigatório: `X-Chave: <a chave>`. Erros voltam em JSON
@@ -40,6 +42,7 @@ Cabeçalho obrigatório: `X-Chave: <a chave>`. Erros voltam em JSON
 | `PRAZO_SEGUNDOS` | 85 | tempo máximo de uma conversão do LibreOffice (Office → PDF) |
 | `PRAZO_DOCX_SEGUNDOS` | 75 | tempo máximo da conversão detalhada de PDF para Word; passou disso, sai a conversão simples |
 | `MEMORIA_DOCX_MB` | 900 | teto de memória de cada processo da conversão detalhada (0 = sem teto); estourou, sai a "no lugar" |
+| `PRAZO_XLSX_SEGUNDOS` | 85 | tempo máximo do PDF para Excel |
 | `PROCESSOS_DOCX` | 2 | processos da conversão detalhada (só usa mais de 1 se houver mais de 1 CPU) |
 
 Os prazos somados ficam abaixo de 100 s, que é quanto a Cloudflare espera uma resposta.
@@ -55,7 +58,19 @@ Os prazos somados ficam abaixo de 100 s, que é quanto a Cloudflare espera uma r
 3. Se a detalhada passar do prazo ou falhar, sai a **"no lugar"**. Se até ela falhar, sai a
    **simples** (texto corrido).
 
-O cabeçalho `X-Modo` da resposta diz qual foi usada: `completo`, `posicao` ou `simples`.
+O cabeçalho `X-Modo` da resposta diz qual foi usada: `completo`, `posicao` ou `simples`
+(no PDF para Excel, `planilha`).
+
+### PDF para Excel
+- Tabela com grade (linhas desenhadas): `page.find_tables()` do PyMuPDF; cada célula vira célula.
+- Relatório sem grade: cada linha do PDF vira uma linha da planilha. As colunas saem do
+  alinhamento: texto que começa no mesmo x, ou número que termina no mesmo x, fica na mesma
+  coluna em todas as páginas. Colunas vizinhas que nunca aparecem juntas na mesma linha viram
+  uma só. Dois espaços ou mais dentro de um texto também separam colunas.
+- Valores brasileiros viram valor de verdade: `1.234,56` e `R$ 10,00` (número), `12,5%`
+  (porcentagem), `01/10/2026` (data). Código com zero à esquerda, CPF, CNPJ e números com 11
+  dígitos ou mais continuam texto.
+- Todas as páginas na mesma aba, uma depois da outra.
 
 ## Testes
 
