@@ -39,19 +39,23 @@ Cabeçalho obrigatório: `X-Chave: <a chave>`. Erros voltam em JSON
 | `MAX_PAGINAS` | 300 | páginas máximas de um PDF para Word |
 | `PRAZO_SEGUNDOS` | 85 | tempo máximo de uma conversão do LibreOffice (Office → PDF) |
 | `PRAZO_DOCX_SEGUNDOS` | 75 | tempo máximo da conversão detalhada de PDF para Word; passou disso, sai a conversão simples |
-| `MEMORIA_DOCX_MB` | 1500 | teto de memória da conversão detalhada (0 = sem teto); estourou, sai a simples |
+| `MEMORIA_DOCX_MB` | 900 | teto de memória de cada processo da conversão detalhada (0 = sem teto); estourou, sai a "no lugar" |
+| `PROCESSOS_DOCX` | 2 | processos da conversão detalhada (só usa mais de 1 se houver mais de 1 CPU) |
 
 Os prazos somados ficam abaixo de 100 s, que é quanto a Cloudflare espera uma resposta.
 
-### PDF para Word em dois níveis
-1. **Detalhada** (pdf2docx): mantém tabelas, colunas e imagens. Roda num processo separado,
-   com prazo e teto de memória, para um PDF complicado não derrubar o servidor.
-2. **Simples** (plano B, só PyMuPDF + python-docx): texto e imagens na ordem da página, com
-   tamanho, negrito, itálico e cor. Sai em segundos. O cabeçalho `X-Modo` da resposta diz
-   qual foi usada (`completo` ou `simples`).
+### PDF para Word: qual conversão é usada
+1. **Relatório em colunas** (de sistema de RH, estoque, contas; sem grade de tabela):
+   vai direto para a conversão **"no lugar"** (`layout.py`). Cada linha vira um parágrafo na
+   mesma altura e cada coluna fica na mesma posição, por tabulação. Fica igual ao PDF e
+   sai em segundos.
+2. **Os outros** vão para a conversão **detalhada** (pdf2docx), que junta as linhas em parágrafos
+   e faz tabela de verdade quando a tabela tem bordas. Ela roda num processo separado, com
+   prazo e teto de memória, para um PDF complicado não derrubar o servidor.
+3. Se a detalhada passar do prazo ou falhar, sai a **"no lugar"**. Se até ela falhar, sai a
+   **simples** (texto corrido).
 
-Recomendado no Cloud Run: 1 CPU, 2 GiB de memória, até 2 pedidos ao mesmo tempo por
-cópia, no máximo 3 cópias, mínimo 0 (só paga quando usa), prazo de 300 s.
+O cabeçalho `X-Modo` da resposta diz qual foi usada: `completo`, `posicao` ou `simples`.
 
 ## Testes
 

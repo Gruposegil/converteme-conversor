@@ -3,8 +3,9 @@ Converteme — servidor de conversão (Google Cloud Run)
 
 O que faz:
   POST /converter?para=docx   PDF  -> Word (.docx), com pdf2docx (MIT) + PyMuPDF (AGPL).
-                              Se a conversão detalhada travar ou falhar, sai uma conversão
-                              simples (texto e imagens); o cabeçalho X-Modo diz qual foi.
+                              Relatório em colunas (ou se a detalhada travar ou falhar): conversão
+                              "no lugar" (layout.py), cada linha na mesma posição do PDF.
+                              O cabeçalho X-Modo diz qual foi: completo, posicao ou simples.
   POST /converter?para=pdf    Word, Excel, PowerPoint, OpenDocument, RTF -> PDF, com LibreOffice (MPL)
   GET  /saude                 "ok" (para o Cloud Run saber que está de pé)
 
@@ -36,10 +37,12 @@ CHAVE = os.environ.get("CHAVE", "")
 MAX_MB = float(os.environ.get("MAX_MB", "30"))   # o Cloud Run aceita até 32 MiB por pedido
 MAX_PAGINAS = int(os.environ.get("MAX_PAGINAS", "300"))
 # a resposta tem de sair em menos de ~100 s (limite de espera da Cloudflare):
-# PDF -> Word: até 75 s na detalhada + poucos segundos na simples; Office -> PDF: até 85 s
+# PDF -> Word: até 75 s na detalhada + poucos segundos na "no lugar"; Office -> PDF: até 85 s
 PRAZO = int(os.environ.get("PRAZO_SEGUNDOS", "85"))
 PRAZO_DOCX = int(os.environ.get("PRAZO_DOCX_SEGUNDOS", "75"))      # conversão detalhada de PDF para Word
-MEMORIA_DOCX_MB = int(os.environ.get("MEMORIA_DOCX_MB", "1500"))   # teto de memória da conversão detalhada (0 = sem teto)
+MEMORIA_DOCX_MB = int(os.environ.get("MEMORIA_DOCX_MB", "900"))    # teto de memória de cada processo da detalhada (0 = sem teto)
+# processos da conversão detalhada (no Cloud Run com 2 CPUs, 2 processos levam quase metade do tempo)
+PROCESSOS_DOCX = max(1, min(int(os.environ.get("PROCESSOS_DOCX", "2")), len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 1))
 SOFFICE = os.environ.get("SOFFICE", shutil.which("soffice") or "soffice")
 
 TIPOS_SAIDA = {
@@ -79,13 +82,44 @@ def tipo_de(dados: bytes) -> str:
 
 
 def _pdf2docx_filho(entrada: str, saida: str) -> None:
-    """Roda num processo separado (veja pdf_para_docx): a conversão detalhada."""
+    """Roda num processo separado (veja pdf_para_docx): a conversão detalhada.
+    Sem a busca de "tabelas sem linhas" (parse_stream_table): ela compara cada pedaço de texto
+    com todos os outros e, num relatório com centenas de pedaços por página, levava ~55 s por
+    página. As tabelas com bordas continuam sendo reconhecidas."""
+    import logging
+    logging.disable(logging.CRITICAL)      # o pdf2docx escreve o andamento no log; não precisamos
     from pdf2docx import Converter
     cv = Converter(entrada)
     try:
-        cv.convert(saida, multi_processing=False)
+        varios = PROCESSOS_DOCX > 1 and len(cv.fitz_doc) >= 4
+        cv.convert(saida, parse_stream_table=False, multi_processing=varios, cpu_count=PROCESSOS_DOCX)
     finally:
         cv.close()
+
+
+def parece_relatorio(entrada: str) -> bool:
+    """Relatório de sistema (colunas alinhadas, sem grade de tabela): vai direto para a conversão
+    "no lugar", que fica igual ao PDF e sai em segundos. Olha só as 6 primeiras páginas."""
+    import pymupdf
+    import layout
+    linhas = colunas = 0
+    with pymupdf.open(entrada) as d:
+        for pagina in list(d)[:6]:
+            verticais = 0
+            for desenho in pagina.get_drawings():
+                for it in desenho["items"]:
+                    if it[0] == "l" and abs(it[1].x - it[2].x) < 1 and abs(it[1].y - it[2].y) > 5:
+                        verticais += 1
+                    elif it[0] == "re" and it[1].width < 2 and it[1].height > 5:
+                        verticais += 1
+            if verticais >= 4:       # tem tabela com grade: a detalhada faz tabela de verdade no Word
+                continue
+            for ln in layout._linhas_da_pagina(pagina):
+                linhas += 1
+                it = ln["itens"]
+                if sum(1 for a, b in zip(it, it[1:]) if b["x0"] - a["x1"] > 8) >= 2:   # 3 ou mais colunas
+                    colunas += 1
+    return colunas >= 15 and colunas / max(1, linhas) >= 0.3
 
 
 def _limitar_memoria():
@@ -144,8 +178,42 @@ def docx_simples(entrada: str, saida: str) -> None:
     doc.save(saida)
 
 
+def _no_lugar(entrada: str, saida: str) -> str:
+    """Conversão "no lugar" (layout.py); se até ela falhar, a de texto corrido. Devolve o modo."""
+    import layout
+    try:
+        layout.converter(entrada, saida)
+        return "posicao"
+    except Exception as e:  # noqa: BLE001
+        registrar(evento="posicao-falhou", classe=type(e).__name__)
+    if os.path.exists(saida):
+        os.remove(saida)
+    try:
+        docx_simples(entrada, saida)
+        return "simples"
+    except Exception as e:  # noqa: BLE001
+        registrar(evento="simples-falhou", classe=type(e).__name__)
+        raise Problema(422, "nao-converteu", "Não consegui converter este PDF em Word. Ele pode estar danificado. Tente abrir e salvar de novo como PDF, ou dividir em partes no Dividir PDF.")
+
+
+def _rodar_com_prazo(cmd, prazo):
+    """Roda e, se passar do prazo, mata o processo e os que ele abriu (os da conversão em paralelo)."""
+    import signal
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_limitar_memoria)
+    try:
+        return proc.wait(timeout=prazo)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+
+
 def pdf_para_docx(pasta: str, entrada: str):
-    """Devolve (caminho, modo). modo = "completo" (pdf2docx) ou "simples" (plano B)."""
+    """Devolve (caminho, modo). modo = "completo" (pdf2docx), "posicao" (layout.py: cada linha
+    no mesmo lugar) ou "simples" (texto corrido, último recurso)."""
     import pymupdf as fitz  # PyMuPDF
     with fitz.open(entrada) as d:
         if d.needs_pass:
@@ -155,13 +223,19 @@ def pdf_para_docx(pasta: str, entrada: str):
         if d.page_count == 0:
             raise Problema(422, "vazio", "Este PDF não tem páginas.")
     saida = os.path.join(pasta, "saida.docx")
+    try:
+        relatorio = parece_relatorio(entrada)
+    except Exception:  # noqa: BLE001 — na dúvida, segue o caminho normal
+        relatorio = False
+    if relatorio:
+        registrar(evento="relatorio")
+        return saida, _no_lugar(entrada, saida)
     # a conversão detalhada roda num processo separado, com prazo e teto de memória:
     # se travar, estourar a memória ou der erro, o servidor continua de pé e usa o plano B
     motivo = ""
     try:
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--pdf2docx", entrada, saida], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=PRAZO_DOCX, preexec_fn=_limitar_memoria)
-        if r.returncode == 0 and os.path.exists(saida) and os.path.getsize(saida) > 0:
+        rc = _rodar_com_prazo([sys.executable, os.path.abspath(__file__), "--pdf2docx", entrada, saida], PRAZO_DOCX)
+        if rc == 0 and os.path.exists(saida) and os.path.getsize(saida) > 0:
             return saida, "completo"
         motivo = "erro"
     except subprocess.TimeoutExpired:
@@ -169,12 +243,7 @@ def pdf_para_docx(pasta: str, entrada: str):
     registrar(evento="plano-b", motivo=motivo)
     if os.path.exists(saida):
         os.remove(saida)
-    try:
-        docx_simples(entrada, saida)
-    except Exception as e:  # noqa: BLE001
-        registrar(evento="simples-falhou", classe=type(e).__name__)
-        raise Problema(422, "nao-converteu", "Não consegui converter este PDF em Word. Ele pode estar danificado. Tente abrir e salvar de novo como PDF, ou dividir em partes no Dividir PDF.")
-    return saida, "simples"
+    return saida, _no_lugar(entrada, saida)
 
 
 def office_para_pdf(pasta: str, entrada: str) -> str:

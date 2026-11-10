@@ -32,6 +32,41 @@ def xlsx_exemplo():
     return b.getvalue()
 
 
+def relatorio_exemplo(paginas=3):
+    """Relatório como os de sistema de RH, com dados inventados: cabeçalho, linhas horizontais,
+    e cada campo escrito numa posição fixa (sem grade de tabela)."""
+    import pymupdf
+    d = pymupdf.open()
+    n = 0
+    for pg in range(paginas):
+        p = d.new_page(width=595, height=839)
+        p.insert_text((20, 30), "Empresa:  EMPRESA FICTICIA DE TESTE LTDA", fontsize=9)
+        p.insert_text((500, 30), f"Página: {pg + 1:04d}", fontsize=8)
+        p.draw_line((20, 42), (584, 42))
+        p.insert_text((24, 92), "Código  Nome", fontsize=7)
+        for x, t in ((270, "Admissão"), (330, "Vcto. Férias"), (385, "Conceder até")):
+            p.insert_text((x, 92), t, fontsize=7)
+        p.draw_line((20, 97), (584, 97))
+        y = 120
+        while y < 790:
+            n += 1
+            p.insert_text((24, y), f"{n:06d}  FUNCIONARIO INVENTADO {n:03d}", fontsize=7)
+            p.insert_text((270, y), f"{(n % 28) + 1:02d}/03/2015", fontsize=7)
+            p.insert_text((330, y), f"{(n % 28) + 1:02d}/03/2016", fontsize=7)
+            p.insert_text((385, y), f"{(n % 28) + 1:02d}/02/2017", fontsize=7)
+            for i in range(12):
+                p.insert_text((450 + i * 11, y), "1", fontsize=6)
+            p.insert_text((24, y + 17), "Período aquisitivo", fontsize=7, fontname="hebo")
+            for x, t in ((110, "Faltas"), (220, "Dias gozados"), (280, "Dias de direito")):
+                p.insert_text((x, y + 17), t, fontsize=7, fontname="hebo")
+            p.insert_text((24, y + 26), "INVENTADO", fontsize=7)
+            for x, t in ((130, "0"), (240, "0"), (300, "30")):
+                p.insert_text((x, y + 26), t, fontsize=7)
+            p.draw_line((24, y + 40), (582, y + 40))
+            y += 60
+    return d.tobytes()
+
+
 class TesteConversor(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -99,7 +134,7 @@ class TesteConversor(unittest.TestCase):
         self.assertTrue(d.tables, "a tabela continua tabela")
 
     def test_plano_b_quando_a_detalhada_nao_termina(self):
-        """Com prazo de 0 segundo a conversão detalhada "trava": tem de sair a simples, com texto, negrito e imagem."""
+        """Com prazo de 0 segundo a conversão detalhada "trava": tem de sair a "no lugar", com texto, negrito e imagem."""
         import pymupdf
         from PIL import Image
         porta = porta_livre()
@@ -118,7 +153,7 @@ class TesteConversor(unittest.TestCase):
             d.new_page().insert_text((72, 72), "Segunda página", fontsize=11)
             req = urllib.request.Request(f"http://127.0.0.1:{porta}/converter?para=docx", data=d.tobytes(), method="POST", headers={"X-Chave": CHAVE})
             with urllib.request.urlopen(req, timeout=60) as r:
-                self.assertEqual(r.headers["X-Modo"], "simples")
+                self.assertEqual(r.headers["X-Modo"], "posicao")
                 corpo = r.read()
             from docx import Document
             doc = Document(io.BytesIO(corpo))
@@ -132,7 +167,7 @@ class TesteConversor(unittest.TestCase):
             proc.terminate(); proc.wait(5)
 
     def test_plano_b_quando_a_detalhada_estoura_a_memoria(self):
-        """Com teto de memória minúsculo a conversão detalhada morre: o servidor continua de pé e entrega a simples."""
+        """Com teto de memória minúsculo a conversão detalhada morre: o servidor continua de pé e entrega a "no lugar"."""
         import pymupdf
         porta = porta_livre()
         proc = subprocess.Popen([sys.executable, APP], env={**os.environ, "PORT": str(porta), "CHAVE": CHAVE, "MEMORIA_DOCX_MB": "40"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -145,12 +180,48 @@ class TesteConversor(unittest.TestCase):
             d = pymupdf.open(); d.new_page().insert_text((72, 72), "Texto inventado para o teste", fontsize=12)
             req = urllib.request.Request(f"http://127.0.0.1:{porta}/converter?para=docx", data=d.tobytes(), method="POST", headers={"X-Chave": CHAVE})
             with urllib.request.urlopen(req, timeout=60) as r:
-                self.assertEqual(r.headers["X-Modo"], "simples")
+                self.assertEqual(r.headers["X-Modo"], "posicao")
                 from docx import Document
                 self.assertIn("Texto inventado", "\n".join(p.text for p in Document(io.BytesIO(r.read())).paragraphs))
             urllib.request.urlopen(f"http://127.0.0.1:{porta}/saude", timeout=2)   # ainda de pé
         finally:
             proc.terminate(); proc.wait(5)
+
+    def test_relatorio_em_colunas_fica_no_lugar(self):
+        """Relatório de sistema (inventado): vai direto para a conversão "no lugar", rápida,
+        com as mesmas páginas e cada linha na mesma altura e coluna do PDF."""
+        import pymupdf, re, shutil, tempfile
+        pdf = relatorio_exemplo()
+        inicio = time.time()
+        st, docx, h = self.pedir(pdf, "docx")
+        self.assertEqual(st, 200, docx[:300])
+        self.assertEqual(h["X-Modo"], "posicao")
+        self.assertLess(time.time() - inicio, 20, "sai em segundos")
+        from docx import Document
+        d = Document(io.BytesIO(docx))
+        texto = "\n".join(p.text for p in d.paragraphs)
+        self.assertIn("FUNCIONARIO INVENTADO 007", texto)
+        self.assertIn("Período aquisitivo", texto)
+        self.assertTrue(any(p.paragraph_format.tab_stops and len(p.paragraph_format.tab_stops) >= 3 for p in d.paragraphs), "colunas por tabulação")
+        # abre o Word no LibreOffice e confere páginas e posições
+        pasta = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(pasta, "r.docx"), "wb") as f:
+                f.write(docx)
+            subprocess.run(["soffice", f"-env:UserInstallation=file://{pasta}/perfil", "--headless", "--convert-to", "pdf", "--outdir", pasta, os.path.join(pasta, "r.docx")], capture_output=True, timeout=120)
+            with pymupdf.open(stream=pdf, filetype="pdf") as orig, pymupdf.open(os.path.join(pasta, "r.pdf")) as volta:
+                self.assertEqual(volta.page_count, orig.page_count, "mesmo número de páginas")
+                for n in range(orig.page_count):
+                    def posicoes(pg):
+                        return {w[4]: (w[0], w[1]) for w in pg.get_text("words") if re.fullmatch(r"\d{2}/\d{2}/\d{4}|INVENTADO", w[4])}
+                    a, b = posicoes(orig[n]), posicoes(volta[n])
+                    comuns = set(a) & set(b)
+                    self.assertGreater(len(comuns), 5)
+                    for k in comuns:
+                        self.assertAlmostEqual(a[k][0], b[k][0], delta=3, msg=f"coluna de {k} na página {n + 1}")
+                        self.assertAlmostEqual(a[k][1], b[k][1], delta=4, msg=f"altura de {k} na página {n + 1}")
+        finally:
+            shutil.rmtree(pasta, ignore_errors=True)
 
     def test_excel_para_pdf(self):
         st, pdf, _ = self.pedir(xlsx_exemplo(), "pdf", ext=".xlsx")
