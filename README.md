@@ -37,7 +37,18 @@ Cabeçalho obrigatório: `X-Chave: <a chave>`. Erros voltam em JSON
 | `CHAVE` | (vazia = recusa tudo) | chave combinada com o Worker. **Nunca colocar no código.** |
 | `MAX_MB` | 30 | tamanho máximo do arquivo (o Cloud Run aceita até 32 MiB por pedido) |
 | `MAX_PAGINAS` | 300 | páginas máximas de um PDF para Word |
-| `PRAZO_SEGUNDOS` | 150 | tempo máximo de uma conversão do LibreOffice |
+| `PRAZO_SEGUNDOS` | 85 | tempo máximo de uma conversão do LibreOffice (Office → PDF) |
+| `PRAZO_DOCX_SEGUNDOS` | 75 | tempo máximo da conversão detalhada de PDF para Word; passou disso, sai a conversão simples |
+| `MEMORIA_DOCX_MB` | 1500 | teto de memória da conversão detalhada (0 = sem teto); estourou, sai a simples |
+
+Os prazos somados ficam abaixo de 100 s, que é quanto a Cloudflare espera uma resposta.
+
+### PDF para Word em dois níveis
+1. **Detalhada** (pdf2docx): mantém tabelas, colunas e imagens. Roda num processo separado,
+   com prazo e teto de memória, para um PDF complicado não derrubar o servidor.
+2. **Simples** (plano B, só PyMuPDF + python-docx): texto e imagens na ordem da página, com
+   tamanho, negrito, itálico e cor. Sai em segundos. O cabeçalho `X-Modo` da resposta diz
+   qual foi usada (`completo` ou `simples`).
 
 Recomendado no Cloud Run: 1 CPU, 2 GiB de memória, até 2 pedidos ao mesmo tempo por
 cópia, no máximo 3 cópias, mínimo 0 (só paga quando usa), prazo de 300 s.

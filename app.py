@@ -2,7 +2,9 @@
 Converteme — servidor de conversão (Google Cloud Run)
 
 O que faz:
-  POST /converter?para=docx   PDF  -> Word (.docx), com pdf2docx (MIT) + PyMuPDF (AGPL)
+  POST /converter?para=docx   PDF  -> Word (.docx), com pdf2docx (MIT) + PyMuPDF (AGPL).
+                              Se a conversão detalhada travar ou falhar, sai uma conversão
+                              simples (texto e imagens); o cabeçalho X-Modo diz qual foi.
   POST /converter?para=pdf    Word, Excel, PowerPoint, OpenDocument, RTF -> PDF, com LibreOffice (MPL)
   GET  /saude                 "ok" (para o Cloud Run saber que está de pé)
 
@@ -33,7 +35,11 @@ PORTA = int(os.environ.get("PORT", "8080"))
 CHAVE = os.environ.get("CHAVE", "")
 MAX_MB = float(os.environ.get("MAX_MB", "30"))   # o Cloud Run aceita até 32 MiB por pedido
 MAX_PAGINAS = int(os.environ.get("MAX_PAGINAS", "300"))
-PRAZO = int(os.environ.get("PRAZO_SEGUNDOS", "150"))
+# a resposta tem de sair em menos de ~100 s (limite de espera da Cloudflare):
+# PDF -> Word: até 75 s na detalhada + poucos segundos na simples; Office -> PDF: até 85 s
+PRAZO = int(os.environ.get("PRAZO_SEGUNDOS", "85"))
+PRAZO_DOCX = int(os.environ.get("PRAZO_DOCX_SEGUNDOS", "75"))      # conversão detalhada de PDF para Word
+MEMORIA_DOCX_MB = int(os.environ.get("MEMORIA_DOCX_MB", "1500"))   # teto de memória da conversão detalhada (0 = sem teto)
 SOFFICE = os.environ.get("SOFFICE", shutil.which("soffice") or "soffice")
 
 TIPOS_SAIDA = {
@@ -72,9 +78,75 @@ def tipo_de(dados: bytes) -> str:
     return "desconhecido"
 
 
-def pdf_para_docx(pasta: str, entrada: str) -> str:
-    import pymupdf as fitz  # PyMuPDF
+def _pdf2docx_filho(entrada: str, saida: str) -> None:
+    """Roda num processo separado (veja pdf_para_docx): a conversão detalhada."""
     from pdf2docx import Converter
+    cv = Converter(entrada)
+    try:
+        cv.convert(saida, multi_processing=False)
+    finally:
+        cv.close()
+
+
+def _limitar_memoria():
+    if MEMORIA_DOCX_MB > 0:
+        import resource
+        teto = MEMORIA_DOCX_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (teto, teto))
+
+
+def docx_simples(entrada: str, saida: str) -> None:
+    """Plano B: texto corrido e imagens na ordem de leitura (sem tabelas nem colunas).
+    Rápido e à prova de PDFs complicados; mantém tamanho da letra, negrito, itálico e cor."""
+    import io
+    import pymupdf
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Emu
+    doc = Document()
+    with pymupdf.open(entrada) as pdf:
+        for n, pagina in enumerate(pdf):
+            if n == 0:
+                sec = doc.sections[0]
+                sec.page_width, sec.page_height = Emu(int(pagina.rect.width * 12700)), Emu(int(pagina.rect.height * 12700))
+                for lado in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+                    setattr(sec, lado, Pt(50))
+            else:
+                doc.add_page_break()
+            largura_util = pagina.rect.width - 100
+            blocos = pagina.get_text("dict", sort=True).get("blocks", [])
+            for b in blocos:
+                if b.get("type") == 1:      # imagem
+                    try:
+                        w = min(largura_util, b["bbox"][2] - b["bbox"][0])
+                        if w > 20 and b.get("image"):
+                            doc.add_picture(io.BytesIO(b["image"]), width=Pt(w))
+                    except Exception:  # noqa: BLE001 — imagem em formato que o Word não aceita: segue sem ela
+                        pass
+                    continue
+                par = None
+                for linha in b.get("lines", []):
+                    trechos = [t for t in linha.get("spans", []) if t.get("text")]
+                    if not "".join(t["text"] for t in trechos).strip():
+                        continue
+                    if par is None:
+                        par = doc.add_paragraph()
+                        par.paragraph_format.space_after = Pt(6)
+                    elif par.runs and not par.runs[-1].text.endswith((" ", "-")):
+                        par.add_run(" ")
+                    for t in trechos:
+                        r = par.add_run(t["text"])
+                        r.font.size = Pt(max(5, min(72, round(t.get("size", 11) * 2) / 2)))
+                        f = t.get("flags", 0)
+                        r.bold, r.italic = bool(f & 16), bool(f & 2)
+                        c = t.get("color", 0)
+                        if c:
+                            r.font.color.rgb = RGBColor((c >> 16) & 255, (c >> 8) & 255, c & 255)
+    doc.save(saida)
+
+
+def pdf_para_docx(pasta: str, entrada: str):
+    """Devolve (caminho, modo). modo = "completo" (pdf2docx) ou "simples" (plano B)."""
+    import pymupdf as fitz  # PyMuPDF
     with fitz.open(entrada) as d:
         if d.needs_pass:
             raise Problema(422, "senha", "Este PDF tem senha. Tire a senha primeiro e tente de novo.")
@@ -83,12 +155,26 @@ def pdf_para_docx(pasta: str, entrada: str) -> str:
         if d.page_count == 0:
             raise Problema(422, "vazio", "Este PDF não tem páginas.")
     saida = os.path.join(pasta, "saida.docx")
-    cv = Converter(entrada)
+    # a conversão detalhada roda num processo separado, com prazo e teto de memória:
+    # se travar, estourar a memória ou der erro, o servidor continua de pé e usa o plano B
+    motivo = ""
     try:
-        cv.convert(saida, multi_processing=False)
-    finally:
-        cv.close()
-    return saida
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--pdf2docx", entrada, saida], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=PRAZO_DOCX, preexec_fn=_limitar_memoria)
+        if r.returncode == 0 and os.path.exists(saida) and os.path.getsize(saida) > 0:
+            return saida, "completo"
+        motivo = "erro"
+    except subprocess.TimeoutExpired:
+        motivo = "prazo"
+    registrar(evento="plano-b", motivo=motivo)
+    if os.path.exists(saida):
+        os.remove(saida)
+    try:
+        docx_simples(entrada, saida)
+    except Exception as e:  # noqa: BLE001
+        registrar(evento="simples-falhou", classe=type(e).__name__)
+        raise Problema(422, "nao-converteu", "Não consegui converter este PDF em Word. Ele pode estar danificado. Tente abrir e salvar de novo como PDF, ou dividir em partes no Dividir PDF.")
+    return saida, "simples"
 
 
 def office_para_pdf(pasta: str, entrada: str) -> str:
@@ -123,15 +209,15 @@ def converter(dados: bytes, para: str, nome_ext: str):
         if para == "docx":
             if tipo != "pdf":
                 raise Problema(415, "tipo", "Para converter em Word, envie um PDF.")
-            caminho = pdf_para_docx(pasta, entrada)
+            caminho, modo = pdf_para_docx(pasta, entrada)
         elif para == "pdf":
             if tipo in ("pdf", "desconhecido"):
                 raise Problema(415, "tipo", "Envie um arquivo do Word, Excel, PowerPoint ou OpenDocument.")
-            caminho = office_para_pdf(pasta, entrada)
+            caminho, modo = office_para_pdf(pasta, entrada), "completo"
         else:
             raise Problema(400, "para", "Formato de saída desconhecido.")
         with open(caminho, "rb") as f:
-            return f.read(), tipo
+            return f.read(), tipo, modo
     finally:
         shutil.rmtree(pasta, ignore_errors=True)
 
@@ -189,7 +275,7 @@ class Pedido(BaseHTTPRequestHandler):
             return self.erro(Problema(413, "grande", f"Arquivo grande demais. O limite é {int(MAX_MB)} MB."))
         dados = self.rfile.read(tamanho)
         try:
-            saida, tipo = converter(dados, para, nome_ext)
+            saida, tipo, modo = converter(dados, para, nome_ext)
         except Problema as p:
             registrar(evento="erro", para=para, codigo=p.codigo, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
             return self.erro(p)
@@ -198,8 +284,8 @@ class Pedido(BaseHTTPRequestHandler):
             return self.erro(Problema(500, "falha", "Não consegui converter este arquivo."))
         finally:
             dados = None
-        registrar(evento="convertido", de=tipo, para=para, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
-        self.responder(200, saida, TIPOS_SAIDA[para], {"X-Pedido": uuid.uuid4().hex[:8]})
+        registrar(evento="convertido", de=tipo, para=para, modo=modo, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
+        self.responder(200, saida, TIPOS_SAIDA[para], {"X-Pedido": uuid.uuid4().hex[:8], "X-Modo": modo})
 
 
 def main():
@@ -210,4 +296,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == "--pdf2docx":
+        _pdf2docx_filho(sys.argv[2], sys.argv[3])
+    else:
+        main()

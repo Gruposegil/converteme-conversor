@@ -90,12 +90,67 @@ class TesteConversor(unittest.TestCase):
         # e de volta para Word
         st, docx, h = self.pedir(pdf, "docx")
         self.assertEqual(st, 200, docx[:300])
+        self.assertEqual(h["X-Modo"], "completo")
         from docx import Document
         d = Document(io.BytesIO(docx))
         tudo = "\n".join(p.text for p in d.paragraphs) + "\n" + "\n".join(c.text for t in d.tables for r in t.rows for c in r.cells)
         self.assertIn("coração", tudo)
         self.assertIn("1.234,56", tudo)
         self.assertTrue(d.tables, "a tabela continua tabela")
+
+    def test_plano_b_quando_a_detalhada_nao_termina(self):
+        """Com prazo de 0 segundo a conversão detalhada "trava": tem de sair a simples, com texto, negrito e imagem."""
+        import pymupdf
+        from PIL import Image
+        porta = porta_livre()
+        proc = subprocess.Popen([sys.executable, APP], env={**os.environ, "PORT": str(porta), "CHAVE": CHAVE, "PRAZO_DOCX_SEGUNDOS": "0"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for _ in range(100):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{porta}/saude", timeout=1); break
+                except Exception:
+                    time.sleep(0.1)
+            d = pymupdf.open(); pg = d.new_page()
+            pg.insert_text((72, 72), "Relatório complicado", fontsize=18, fontname="hebo")
+            pg.insert_text((72, 110), "Primeira linha do parágrafo com ação.", fontsize=11)
+            b = io.BytesIO(); Image.new("RGB", (120, 60), (20, 90, 200)).save(b, "PNG")
+            pg.insert_image(pymupdf.Rect(72, 150, 192, 210), stream=b.getvalue())
+            d.new_page().insert_text((72, 72), "Segunda página", fontsize=11)
+            req = urllib.request.Request(f"http://127.0.0.1:{porta}/converter?para=docx", data=d.tobytes(), method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                self.assertEqual(r.headers["X-Modo"], "simples")
+                corpo = r.read()
+            from docx import Document
+            doc = Document(io.BytesIO(corpo))
+            textos = [p.text for p in doc.paragraphs if p.text.strip()]
+            self.assertIn("Relatório complicado", textos[0])
+            self.assertTrue(doc.paragraphs[0].runs[0].bold or any(r.bold for p in doc.paragraphs for r in p.runs if "Relatório" in r.text), "negrito mantido")
+            self.assertTrue(any("ação" in t for t in textos))
+            self.assertTrue(any("Segunda página" in t for t in textos))
+            self.assertEqual(len(doc.inline_shapes), 1, "a imagem veio junto")
+        finally:
+            proc.terminate(); proc.wait(5)
+
+    def test_plano_b_quando_a_detalhada_estoura_a_memoria(self):
+        """Com teto de memória minúsculo a conversão detalhada morre: o servidor continua de pé e entrega a simples."""
+        import pymupdf
+        porta = porta_livre()
+        proc = subprocess.Popen([sys.executable, APP], env={**os.environ, "PORT": str(porta), "CHAVE": CHAVE, "MEMORIA_DOCX_MB": "40"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for _ in range(100):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{porta}/saude", timeout=1); break
+                except Exception:
+                    time.sleep(0.1)
+            d = pymupdf.open(); d.new_page().insert_text((72, 72), "Texto inventado para o teste", fontsize=12)
+            req = urllib.request.Request(f"http://127.0.0.1:{porta}/converter?para=docx", data=d.tobytes(), method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                self.assertEqual(r.headers["X-Modo"], "simples")
+                from docx import Document
+                self.assertIn("Texto inventado", "\n".join(p.text for p in Document(io.BytesIO(r.read())).paragraphs))
+            urllib.request.urlopen(f"http://127.0.0.1:{porta}/saude", timeout=2)   # ainda de pé
+        finally:
+            proc.terminate(); proc.wait(5)
 
     def test_excel_para_pdf(self):
         st, pdf, _ = self.pedir(xlsx_exemplo(), "pdf", ext=".xlsx")
