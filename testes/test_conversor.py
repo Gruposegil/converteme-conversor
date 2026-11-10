@@ -264,6 +264,50 @@ class TesteConversor(unittest.TestCase):
         self.assertEqual(celulas[(item.row, item.column + 1)].value, "Valor")
         self.assertEqual(item.column, servico.column, "mesma coluna da tabela")
 
+    def test_pdf_para_excel_numero_embaixo_do_titulo(self):
+        """Título alinhado à esquerda e número alinhado à direita, dentro da largura do título
+        (como no relatório de férias): o número fica na coluna do título, e não na vizinha.
+        Um texto largo de cabeçalho por perto ("Documento:") não pode puxar os números."""
+        import pymupdf
+        from openpyxl import load_workbook
+        d = pymupdf.open()
+        f = pymupdf.Font("helv")
+        meses = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun"]
+        for pg in range(2):
+            p = d.new_page(width=595, height=842)
+            p.insert_text((330, 40), "Documento:", fontsize=9)
+            for i, m in enumerate(meses):
+                p.insert_text((340 + i * 15, 60), m, fontsize=6)
+            y = 90
+            for n in range(12):
+                p.insert_text((24, y), "Período inventado", fontsize=7, fontname="hebo")
+                for x, t in ((110, "Faltas no período"), (200, "Dias gozados"), (260, "Dias de direito")):
+                    p.insert_text((x, y), t, fontsize=7, fontname="hebo")
+                for x_fim, v in ((160, str(n * 7)), (236, str(n % 3)), (300, str(30 - n))):
+                    p.insert_text((x_fim - f.text_length(v, 7), y + 10), v, fontsize=7)       # números alinhados à direita
+                for i in range(len(meses)):
+                    v = str(n % 2 + 1)
+                    p.insert_text((350 + i * 15 - f.text_length(v, 6), y + 10), v, fontsize=6)
+                y += 40
+        st, xlsx, _ = self.pedir(d.tobytes(), "xlsx")
+        self.assertEqual(st, 200, xlsx[:300])
+        ws = load_workbook(io.BytesIO(xlsx)).active
+        col = {}
+        for r in ws.iter_rows():
+            for c in r:
+                if isinstance(c.value, str):
+                    col.setdefault(c.value, set()).add(c.column)
+        numeros = {}
+        for r in ws.iter_rows():
+            vals = [c for c in r if isinstance(c.value, int)]
+            if len(vals) == 3 + len(meses):
+                for k, c in enumerate(vals):
+                    numeros.setdefault(k, set()).add(c.column)
+        self.assertEqual(len(numeros), 3 + len(meses), "achou as linhas de números")
+        titulos = ["Faltas no período", "Dias gozados", "Dias de direito"] + meses
+        for k, t in enumerate(titulos):
+            self.assertEqual(numeros[k], col[t], f"números de {t!r} na coluna do título")
+
     def test_valores_brasileiros(self):
         sys.path.insert(0, os.path.join(AQUI, ".."))
         import datetime

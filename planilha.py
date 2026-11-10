@@ -135,29 +135,72 @@ JUNTAR = 14.0   # pontos: colunas vizinhas que nunca aparecem na mesma linha vir
 
 
 def _ordem_das_colunas(ancoras, linhas_cels):
-    """Ordena as âncoras da esquerda para a direita (posição média do começo das células) e junta
-    numa coluna só as vizinhas que nunca dividem uma linha (relatório com tipos de linha diferentes,
-    como "funcionário" e "período", fica com menos colunas vazias). Devolve {âncora: coluna}."""
-    soma = [[0.0, 0] for _ in ancoras]
-    linhas_de = [set() for _ in ancoras]
+    """Monta as colunas a partir das âncoras e devolve {âncora: coluna}.
+    1. Número fica na coluna do título que está em cima dele: num relatório o título
+       ("Faltas no período") começa à esquerda e o número (51) termina à direita, mas o número
+       fica dentro da largura do título. As duas âncoras viram uma coluna, se nunca dividem linha.
+    2. Colunas vizinhas (até JUNTAR) que nunca dividem uma linha viram uma só (relatório com
+       tipos de linha diferentes, como "funcionário" e "período", fica com menos colunas vazias)."""
+    n = len(ancoras)
+    x0s, x1s, linhas_de = [[] for _ in ancoras], [[] for _ in ancoras], [set() for _ in ancoras]
     for r, cels in enumerate(linhas_cels):
         for c in cels:
             i = _ancora_de(c, ancoras)
             if i is not None:
-                soma[i][0] += c["x0"]
-                soma[i][1] += 1
+                x0s[i].append(c["x0"])
+                x1s[i].append(c["x1"])
                 linhas_de[i].add(r)
-    centro = [s / n if n else a["pos"] for (s, n), a in zip(soma, ancoras)]
-    ordem = sorted(range(len(ancoras)), key=lambda i: centro[i])
-    coluna, grupos = {}, []          # grupos: [centro do último, linhas usadas]
-    for i in ordem:
-        g = grupos[-1] if grupos else None
-        if g is not None and centro[i] - g[0] <= JUNTAR and not (g[1] & linhas_de[i]):
-            g[0] = centro[i]
-            g[1] |= linhas_de[i]
+    mediana = lambda v: sorted(v)[len(v) // 2]
+    ini = [mediana(x0s[i]) if x0s[i] else ancoras[i]["pos"] for i in range(n)]
+    fim = [mediana(x1s[i]) if x1s[i] else ancoras[i]["pos"] for i in range(n)]
+    pai = list(range(n))
+    linhas = [set(l) for l in linhas_de]
+
+    def raiz(i):
+        while pai[i] != i:
+            pai[i] = pai[pai[i]]
+            i = pai[i]
+        return i
+
+    def unir(a, b):
+        a, b = raiz(a), raiz(b)
+        if a != b:
+            pai[a] = b
+            linhas[b] |= linhas[a]
+
+    # larguras de verdade dos textos de cada âncora (uma âncora pode ter "Jun" e "Agendamento de férias")
+    larguras = [{(round(x0), round(x1)) for x0, x1 in zip(x0s[i], x1s[i])} for i in range(n)]
+
+    def encaixe(t, meio):
+        """Quão bem o título t fica em cima do número: o mais centrado e mais estreito vence."""
+        notas = [abs((e0 + e1) / 2 - meio) + 0.1 * (e1 - e0) for e0, e1 in larguras[t] if e0 - 2 <= meio <= e1 + 2 and e1 - e0 < 160]
+        return min(notas) if notas else None
+
+    textos = [i for i in range(n) if ancoras[i]["tipo"] == "E" and x0s[i]]
+    for d in sorted((i for i in range(n) if ancoras[i]["tipo"] == "D" and x0s[i]), key=lambda i: -len(x0s[i])):
+        meio = (ini[d] + fim[d]) / 2
+        candidatos = [(encaixe(t, meio), t) for t in textos if raiz(t) != raiz(d) and not (linhas[raiz(t)] & linhas[raiz(d)])]
+        candidatos = [c for c in candidatos if c[0] is not None]
+        if candidatos:
+            unir(d, min(candidatos)[1])
+    # posição de cada grupo: o começo dos textos dele (ou dos números, se só tem número)
+    membros = {}
+    for i in range(n):
+        membros.setdefault(raiz(i), []).append(i)
+    pos = {}
+    for g, ms in membros.items():
+        t = [ini[i] for i in ms if ancoras[i]["tipo"] == "E" and x0s[i]] or [ini[i] for i in ms]
+        pos[g] = sum(t) / len(t)
+    coluna, grupos = {}, []          # grupos: [posição do último, linhas usadas]
+    for g in sorted(membros, key=lambda g: pos[g]):
+        ult = grupos[-1] if grupos else None
+        if ult is not None and pos[g] - ult[0] <= JUNTAR and not (ult[1] & linhas[g]):
+            ult[0] = pos[g]
+            ult[1] |= linhas[g]
         else:
-            grupos.append([centro[i], set(linhas_de[i])])
-        coluna[i] = len(grupos) - 1
+            grupos.append([pos[g], set(linhas[g])])
+        for i in membros[g]:
+            coluna[i] = len(grupos) - 1
     return coluna
 
 
