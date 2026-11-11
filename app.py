@@ -196,7 +196,7 @@ def _no_lugar(entrada: str, saida: str) -> str:
         return "simples"
     except Exception as e:  # noqa: BLE001
         registrar(evento="simples-falhou", classe=type(e).__name__)
-        raise Problema(422, "nao-converteu", "Não consegui converter este PDF em Word. Ele pode estar danificado. Tente abrir e salvar de novo como PDF, ou dividir em partes no Dividir PDF.")
+        raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em Word. O arquivo pode estar danificado. Tente salvá-lo novamente como PDF ou dividi-lo em partes com o Dividir PDF.")
 
 
 def _rodar_com_prazo(cmd, prazo):
@@ -218,7 +218,7 @@ def _conferir_pdf(entrada: str) -> None:
     import pymupdf as fitz  # PyMuPDF
     with fitz.open(entrada) as d:
         if d.needs_pass:
-            raise Problema(422, "senha", "Este PDF tem senha. Tire a senha primeiro e tente de novo.")
+            raise Problema(422, "senha", "Este PDF é protegido por senha. Remova a senha com o Desbloquear PDF e tente novamente.")
         if d.page_count > MAX_PAGINAS:
             raise Problema(413, "paginas", f"Este PDF tem {d.page_count} páginas. O limite é {MAX_PAGINAS}.")
         if d.page_count == 0:
@@ -232,9 +232,9 @@ def pdf_para_xlsx(pasta: str, entrada: str) -> str:
     try:
         rc = _rodar_com_prazo([sys.executable, os.path.abspath(__file__), "--planilha", entrada, saida], PRAZO_XLSX)
     except subprocess.TimeoutExpired:
-        raise Problema(504, "demorou", "Este PDF é complexo demais para virar planilha. Tente dividir em partes menores no Dividir PDF.")
+        raise Problema(504, "demorou", "Este PDF é complexo demais para ser convertido em planilha. Divida-o em partes menores com o Dividir PDF.")
     if rc != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
-        raise Problema(422, "nao-converteu", "Não consegui transformar este PDF em planilha. Ele pode estar danificado.")
+        raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em planilha. O arquivo pode estar danificado.")
     return saida
 
 
@@ -274,10 +274,10 @@ def office_para_pdf(pasta: str, entrada: str) -> str:
         try:
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PRAZO, env={**os.environ, "HOME": pasta})
         except subprocess.TimeoutExpired:
-            raise Problema(504, "demorou", "A conversão demorou demais. Tente um arquivo menor.")
+            raise Problema(504, "demorou", "A conversão excedeu o tempo limite. Tente um arquivo menor.")
     saida = os.path.splitext(entrada)[0] + ".pdf"
     if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
-        raise Problema(422, "nao-converteu", "Não consegui converter este arquivo. Ele pode estar danificado ou protegido por senha.")
+        raise Problema(422, "nao-converteu", "Não foi possível converter este arquivo. Ele pode estar danificado ou protegido por senha.")
     return saida
 
 
@@ -374,7 +374,7 @@ class Pedido(BaseHTTPRequestHandler):
             return self.erro(p)
         except Exception as e:  # noqa: BLE001 — qualquer outra falha vira resposta clara, sem detalhes do arquivo
             registrar(evento="falha", para=para, classe=type(e).__name__, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
-            return self.erro(Problema(500, "falha", "Não consegui converter este arquivo."))
+            return self.erro(Problema(500, "falha", "Não foi possível converter este arquivo."))
         finally:
             dados = None
         registrar(evento="convertido", de=tipo, para=para, modo=modo, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
