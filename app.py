@@ -7,6 +7,8 @@ O que faz:
                               "no lugar" (layout.py), cada linha na mesma posição do PDF.
                               O cabeçalho X-Modo diz qual foi: completo, posicao ou simples.
   POST /converter?para=xlsx   PDF  -> Excel (.xlsx), com planilha.py (tabelas com grade e relatórios em colunas)
+  POST /converter?para=pptx   PDF  -> PowerPoint (.pptx), com LibreOffice (Impress)
+  POST /converter?para=pdfa&nivel=2   PDF -> PDF/A-2b (ou nivel=1: PDF/A-1b), com Ghostscript (AGPL)
   POST /converter?para=pdf    Word, Excel, PowerPoint, OpenDocument, RTF -> PDF, com LibreOffice (MPL)
   GET  /saude                 "ok" (para o Cloud Run saber que está de pé)
 
@@ -51,7 +53,10 @@ TIPOS_SAIDA = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "pdfa": "application/pdf",
 }
+GS = os.environ.get("GS", shutil.which("gs") or "gs")
 # uma conversão do LibreOffice por vez em cada cópia do servidor (ele não gosta de concorrência)
 TRAVA_LO = threading.Lock()
 
@@ -284,7 +289,102 @@ def office_para_pdf(pasta: str, entrada: str) -> str:
 EXTENSAO = {"pdf": ".pdf", "ole": ".doc", "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx", "odf": ".odt", "zip-office": ".docx", "rtf": ".rtf"}
 
 
-def converter(dados: bytes, para: str, nome_ext: str):
+def pdf_para_pptx(pasta: str, entrada: str) -> str:
+    """PDF -> PowerPoint pelo LibreOffice (Impress): cada página vira um slide, com o texto em
+    caixas editáveis e os desenhos e imagens no lugar."""
+    _conferir_pdf(entrada)
+    perfil = os.path.join(pasta, "perfil-lo")
+    destino = os.path.join(pasta, "pptx")
+    cmd = [SOFFICE, f"-env:UserInstallation=file://{perfil}", "--headless", "--norestore", "--nolockcheck",
+           "--infilter=impress_pdf_import", "--convert-to", "pptx", "--outdir", destino, entrada]
+    with TRAVA_LO:
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PRAZO, env={**os.environ, "HOME": pasta})
+        except subprocess.TimeoutExpired:
+            raise Problema(504, "demorou", "A conversão excedeu o tempo limite. Divida o PDF em partes menores com o Dividir PDF.")
+    saida = os.path.join(destino, os.path.splitext(os.path.basename(entrada))[0] + ".pptx")
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
+        raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em PowerPoint. O arquivo pode estar danificado.")
+    return saida
+
+
+def _icc_rgb() -> str:
+    """Perfil de cor sRGB que acompanha o Ghostscript (o PDF/A exige um perfil de saída)."""
+    import glob
+    achados = sorted(glob.glob("/usr/share/ghostscript/*/iccprofiles/default_rgb.icc")) + sorted(glob.glob("/usr/share/color/icc/ghostscript/default_rgb.icc"))
+    if not achados:
+        raise Problema(500, "sem-icc", "O serviço de PDF/A está indisponível no momento.")
+    return achados[-1]
+
+
+def pdf_para_pdfa(pasta: str, entrada: str, nivel: str) -> str:
+    """PDF -> PDF/A (2b por padrão, ou 1b) pelo Ghostscript: fontes embutidas, perfil de cor sRGB
+    (OutputIntent) e metadados XMP de PDF/A."""
+    _conferir_pdf(entrada)
+    entrada, textos = _limpar_para_pdfa(pasta, entrada)
+    icc = _icc_rgb()
+    definicao = os.path.join(pasta, "pdfa_def.ps")
+    with open(definicao, "w", encoding="latin-1") as f:
+        f.write(PDFA_DEF.replace("@ICC@", icc.replace("\\", "/")))
+    saida = os.path.join(pasta, "saida-pdfa.pdf")
+    cmd = [GS, "-q", f"-dPDFA={nivel}", "-dBATCH", "-dNOPAUSE", "-dSAFER", "-dPDFACompatibilityPolicy=1",
+           "-sColorConversionStrategy=RGB", "-sDEVICE=pdfwrite", f"--permit-file-read={icc}",
+           f"-sOutputFile={saida}", definicao, entrada]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PRAZO)
+    except subprocess.TimeoutExpired:
+        raise Problema(504, "demorou", "A conversão excedeu o tempo limite. Divida o PDF em partes menores com o Dividir PDF.")
+    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
+        raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em PDF/A. O arquivo pode estar danificado.")
+    # no PDF/A-1 (sem transparência), o Ghostscript transforma em imagem as páginas com transparência:
+    # o texto delas deixa de ser selecionável. Conta essas páginas para avisar quem converteu.
+    import pymupdf
+    viraram_imagem = 0
+    with pymupdf.open(saida) as d:
+        for i, pagina in enumerate(d):
+            if i < len(textos) and textos[i] and not pagina.get_text().strip():
+                viraram_imagem += 1
+    return saida, viraram_imagem
+
+
+def _limpar_para_pdfa(pasta: str, entrada: str):
+    """Tira o que o PDF/A proíbe e o Ghostscript mantém (JavaScript, arquivos anexados)
+    e guarda se cada página tinha texto. Devolve (caminho do PDF limpo, [tem texto por página])."""
+    import pymupdf
+    limpo = os.path.join(pasta, "limpo.pdf")
+    with pymupdf.open(entrada) as d:
+        textos = [bool(p.get_text().strip()) for p in d]
+        d.scrub(attached_files=True, clean_pages=False, embedded_files=True, hidden_text=False, javascript=True,
+                metadata=False, redactions=False, redact_images=0, remove_links=False, reset_fields=False,
+                reset_responses=False, thumbnails=False, xml_metadata=False)
+        cat = d.pdf_catalog()
+        for chave in ("OpenAction", "AA"):
+            tipo, valor = d.xref_get_key(cat, chave)
+            if tipo != "null" and ("JavaScript" in valor or chave == "AA"):
+                d.xref_set_key(cat, chave, "null")
+        d.save(limpo, garbage=1)
+    return limpo, textos
+
+
+# definição do PDF/A para o Ghostscript (baseada no PDFA_def.ps que acompanha o programa):
+# cria o OutputIntent com o perfil sRGB
+PDFA_DEF = """%!
+/ICCProfile (@ICC@) def
+[/_objdef {icc_PDFA} /type /stream /OBJ pdfmark
+[{icc_PDFA} << /N 3 >> /PUT pdfmark
+[{icc_PDFA} ICCProfile (r) file /PUT pdfmark
+[/_objdef {OutputIntent_PDFA} /type /dict /OBJ pdfmark
+[{OutputIntent_PDFA} <<
+  /Type /OutputIntent
+  /S /GTS_PDFA1
+  /DestOutputProfile {icc_PDFA}
+  /OutputConditionIdentifier (sRGB)
+>> /PUT pdfmark
+[{Catalog} <</OutputIntents [ {OutputIntent_PDFA} ]>> /PUT pdfmark
+"""
+
+
+def converter(dados: bytes, para: str, nome_ext: str, nivel: str = "2"):
     tipo = tipo_de(dados)
     pasta = tempfile.mkdtemp(prefix="cm-")
     try:
@@ -303,6 +403,16 @@ def converter(dados: bytes, para: str, nome_ext: str):
             if tipo != "pdf":
                 raise Problema(415, "tipo", "Para converter em Excel, envie um PDF.")
             caminho, modo = pdf_para_xlsx(pasta, entrada), "planilha"
+        elif para == "pptx":
+            if tipo != "pdf":
+                raise Problema(415, "tipo", "Para converter em PowerPoint, envie um PDF.")
+            caminho, modo = pdf_para_pptx(pasta, entrada), "completo"
+        elif para == "pdfa":
+            if tipo != "pdf":
+                raise Problema(415, "tipo", "Para converter em PDF/A, envie um PDF.")
+            nivel = nivel if nivel in ("1", "2", "3") else "2"
+            caminho, viraram_imagem = pdf_para_pdfa(pasta, entrada, nivel)
+            modo = "pdfa-" + nivel + (f"-imagem-{viraram_imagem}" if viraram_imagem else "")
         elif para == "pdf":
             if tipo in ("pdf", "desconhecido"):
                 raise Problema(415, "tipo", "Envie um arquivo do Word, Excel, PowerPoint ou OpenDocument.")
@@ -358,6 +468,7 @@ class Pedido(BaseHTTPRequestHandler):
         para = (q.get("para") or [""])[0]
         ext = (q.get("ext") or [""])[0].lower()
         nome_ext = ext if ext.startswith(".") and len(ext) <= 6 else ""
+        nivel = (q.get("nivel") or ["2"])[0]
         try:
             tamanho = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -368,7 +479,7 @@ class Pedido(BaseHTTPRequestHandler):
             return self.erro(Problema(413, "grande", f"Arquivo grande demais. O limite é {int(MAX_MB)} MB."))
         dados = self.rfile.read(tamanho)
         try:
-            saida, tipo, modo = converter(dados, para, nome_ext)
+            saida, tipo, modo = converter(dados, para, nome_ext, nivel)
         except Problema as p:
             registrar(evento="erro", para=para, codigo=p.codigo, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
             return self.erro(p)

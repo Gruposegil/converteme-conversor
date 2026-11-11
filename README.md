@@ -7,7 +7,9 @@ ferramentas que não dá para fazer no navegador:
 | --- | --- |
 | PDF para Word (.docx) | [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx) (MIT) + [PyMuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0); relatórios em colunas com `layout.py` (próprio) |
 | PDF para Excel (.xlsx) | `planilha.py` (próprio) com PyMuPDF e [openpyxl](https://foss.heptapod.net/openpyxl/openpyxl) (MIT) |
-| Excel, PowerPoint, Word, OpenDocument para PDF | [LibreOffice](https://www.libreoffice.org/) (MPL-2.0), sem interface |
+| PDF para PowerPoint (.pptx) | [LibreOffice](https://www.libreoffice.org/) (MPL-2.0), importação de PDF do Impress: um slide por página, texto em caixas editáveis |
+| PDF para PDF/A (1b ou 2b) | [Ghostscript](https://www.ghostscript.com/) (AGPL-3.0), com perfil de cor sRGB (OutputIntent); antes, o PyMuPDF tira JavaScript e anexos |
+| Excel, PowerPoint, Word (.docx e .doc), OpenDocument para PDF | [LibreOffice](https://www.libreoffice.org/) (MPL-2.0), sem interface |
 
 Roda no **Google Cloud Run, região São Paulo** (`southamerica-east1`).
 
@@ -27,7 +29,13 @@ Roda no **Google Cloud Run, região São Paulo** (`southamerica-east1`).
 | GET | `/saude` | responde `ok` |
 | POST | `/converter?para=docx` | corpo = PDF → devolve .docx |
 | POST | `/converter?para=xlsx` | corpo = PDF → devolve .xlsx |
+| POST | `/converter?para=pptx` | corpo = PDF → devolve .pptx |
+| POST | `/converter?para=pdfa&nivel=2` | corpo = PDF → devolve PDF/A-2b (`nivel=1`: PDF/A-1b) |
 | POST | `/converter?para=pdf&ext=.xlsx` | corpo = Word/Excel/PowerPoint/OpenDocument → devolve PDF |
+
+O cabeçalho de resposta `X-Modo` diz como foi feito: `completo`, `posicao` ou `simples` (PDF para Word);
+`pdfa-2` ou `pdfa-1` (PDF/A), com `-imagem-N` no fim quando N páginas com transparência tiveram de
+virar imagem no PDF/A-1b (o PDF/A-1 não aceita transparência).
 
 Cabeçalho obrigatório: `X-Chave: <a chave>`. Erros voltam em JSON
 (`{"erro": "...", "mensagem": "..."}`, em português).
@@ -75,12 +83,15 @@ O cabeçalho `X-Modo` da resposta diz qual foi usada: `completo`, `posicao` ou `
 ## Testes
 
 ```
-pip install -r requirements.txt python-docx
+pip install -r requirements.txt python-docx python-pptx pikepdf
 python3 -m unittest discover -s testes -v
 ```
-(precisa do LibreOffice instalado: `soffice`)
+(precisa do LibreOffice instalado, com o Draw e o Impress: `soffice`; e do Ghostscript: `gs`)
+
+O PDF/A é conferido nos testes pela identificação (XMP), pelo perfil de cor e pelas fontes
+embutidas. Não foi conferido com um validador completo (veraPDF).
 
 ## Licença
 
-AGPL-3.0 (arquivo `LICENSE`), porque usa o PyMuPDF. Quem usa o servidor pela internet
+AGPL-3.0 (arquivo `LICENSE`), porque usa o PyMuPDF e o Ghostscript. Quem usa o servidor pela internet
 tem direito ao código-fonte: é este repositório.

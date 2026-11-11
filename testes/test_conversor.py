@@ -133,6 +133,22 @@ class TesteConversor(unittest.TestCase):
         self.assertIn("1.234,56", tudo)
         self.assertTrue(d.tables, "a tabela continua tabela")
 
+    def test_word_antigo_doc_para_pdf(self):
+        """.doc (Word 97-2003): o LibreOffice abre o formato antigo e gera o PDF."""
+        import shutil, subprocess, tempfile, pymupdf
+        with tempfile.TemporaryDirectory() as t:
+            with open(os.path.join(t, "a.docx"), "wb") as f:
+                f.write(docx_exemplo())
+            subprocess.run([shutil.which("soffice") or "soffice", f"-env:UserInstallation=file://{t}/perfil", "--headless",
+                            "--convert-to", "doc", "--outdir", t, os.path.join(t, "a.docx")], check=True, capture_output=True, timeout=120)
+            with open(os.path.join(t, "a.doc"), "rb") as f:
+                doc = f.read()
+        self.assertEqual(doc[:4], bytes.fromhex("d0cf11e0"), "é um .doc de verdade (OLE)")
+        st, pdf, h = self.pedir(doc, "pdf", ext=".doc")
+        self.assertEqual(st, 200, pdf[:300])
+        with pymupdf.open(stream=pdf, filetype="pdf") as d:
+            self.assertIn("coração", "".join(p.get_text() for p in d))
+
     def test_plano_b_quando_a_detalhada_nao_termina(self):
         """Com prazo de 0 segundo a conversão detalhada "trava": tem de sair a "no lugar", com texto, negrito e imagem."""
         import pymupdf
@@ -307,6 +323,69 @@ class TesteConversor(unittest.TestCase):
         titulos = ["Faltas no período", "Dias gozados", "Dias de direito"] + meses
         for k, t in enumerate(titulos):
             self.assertEqual(numeros[k], col[t], f"números de {t!r} na coluna do título")
+
+    def _apresentacao(self):
+        import pymupdf
+        d = pymupdf.open()
+        for i in range(3):
+            p = d.new_page(width=842, height=595)
+            p.insert_text((60, 80), f"Apresentação inventada, slide {i + 1}", fontsize=28)
+            p.insert_text((60, 140), "Tópico com acentuação: ação e coração", fontsize=18)
+            p.draw_rect(pymupdf.Rect(500, 250, 780, 500), color=(0.2, 0.4, 0.8), fill=(0.85, 0.9, 1))
+        return d.tobytes()
+
+    def test_pdf_para_powerpoint(self):
+        """Cada página vira um slide, com o texto editável (caixas de texto) e o desenho."""
+        from pptx import Presentation
+        st, pptx, h = self.pedir(self._apresentacao(), "pptx")
+        self.assertEqual(st, 200, pptx[:300])
+        self.assertEqual(h["Content-Type"], "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        apr = Presentation(io.BytesIO(pptx))
+        self.assertEqual(len(apr.slides), 3)
+        textos = [sh.text_frame.text for sh in apr.slides[1].shapes if sh.has_text_frame]
+        self.assertTrue(any("slide 2" in t for t in textos), textos)
+        self.assertTrue(any("coração" in t for t in textos), textos)
+        self.assertGreater(apr.slide_width, apr.slide_height, "paisagem, como o PDF")
+
+    def test_pdf_para_pdfa(self):
+        """PDF/A-2b (padrão) e PDF/A-1b: identificação no XMP, perfil de cor (OutputIntent) e todas as fontes embutidas."""
+        import pikepdf, pymupdf
+        for nivel, esperado in (("2", "2B"), ("1", "1B")):
+            req = urllib.request.Request(f"http://127.0.0.1:{self.porta}/converter?para=pdfa&nivel={nivel}", data=self._apresentacao(), method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                self.assertEqual(r.headers["Content-Type"], "application/pdf")
+                self.assertEqual(r.headers["X-Modo"], "pdfa-" + nivel)
+                corpo = r.read()
+            with pikepdf.open(io.BytesIO(corpo)) as p:
+                self.assertEqual(p.open_metadata().pdfa_status, esperado)
+                self.assertIn("/OutputIntents", p.Root)
+                self.assertEqual(str(p.Root.OutputIntents[0].S), "/GTS_PDFA1")
+            with pymupdf.open(stream=corpo, filetype="pdf") as d:
+                self.assertEqual(d.page_count, 3)
+                fontes = {f[3]: f[1] for pg in d for f in pg.get_fonts(full=True)}
+                self.assertTrue(fontes and all(ext != "n/a" for ext in fontes.values()), f"fontes embutidas: {fontes}")
+                self.assertIn("coração", d[0].get_text())
+
+    def test_pdfa_tira_o_que_o_padrao_proibe(self):
+        """JavaScript e anexos saem; no PDF/A-1b, a página com transparência vira imagem e o servidor avisa."""
+        import pymupdf
+        d = pymupdf.open()
+        p = d.new_page()
+        p.insert_text((50, 50), "Página com transparência")
+        p.draw_rect(pymupdf.Rect(50, 150, 200, 250), fill=(1, 0, 0), fill_opacity=0.5)
+        d.new_page().insert_text((50, 50), "Página comum")
+        d.embfile_add("anexo.txt", b"conteudo inventado")
+        d.xref_set_key(d.pdf_catalog(), "OpenAction", "<< /S /JavaScript /JS (app.alert(1)) >>")
+        original = d.tobytes()
+        for nivel, modo in (("2", "pdfa-2"), ("1", "pdfa-1-imagem-1")):
+            req = urllib.request.Request(f"http://127.0.0.1:{self.porta}/converter?para=pdfa&nivel={nivel}", data=original, method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                self.assertEqual(r.headers["X-Modo"], modo)
+                corpo = r.read()
+            with pymupdf.open(stream=corpo, filetype="pdf") as o:
+                self.assertNotIn("JavaScript", o.xref_object(o.pdf_catalog()))
+                self.assertEqual(o.embfile_count(), 0)
+                self.assertIn("comum", o[1].get_text())
 
     def test_valores_brasileiros(self):
         sys.path.insert(0, os.path.join(AQUI, ".."))
