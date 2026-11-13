@@ -55,6 +55,7 @@ TIPOS_SAIDA = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "pdfa": "application/pdf",
+    "comprimir": "application/pdf",
 }
 GS = os.environ.get("GS", shutil.which("gs") or "gs")
 # uma conversão do LibreOffice por vez em cada cópia do servidor (ele não gosta de concorrência)
@@ -204,10 +205,12 @@ def _no_lugar(entrada: str, saida: str) -> str:
         raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em Word. O arquivo pode estar danificado. Tente salvá-lo novamente como PDF ou dividi-lo em partes com o Dividir PDF.")
 
 
-def _rodar_com_prazo(cmd, prazo):
-    """Roda e, se passar do prazo, mata o processo e os que ele abriu (os da conversão em paralelo)."""
+def _rodar_com_prazo(cmd, prazo, env=None, limitar=True):
+    """Roda e, se passar do prazo, mata o processo e os que ele abriu (os da conversão em paralelo,
+    ou o soffice.bin que o soffice abre)."""
     import signal
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_limitar_memoria)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                            preexec_fn=_limitar_memoria if limitar else None, env=env)
     try:
         return proc.wait(timeout=prazo)
     except subprocess.TimeoutExpired:
@@ -271,17 +274,33 @@ def pdf_para_docx(pasta: str, entrada: str):
     return saida, _no_lugar(entrada, saida)
 
 
-def office_para_pdf(pasta: str, entrada: str) -> str:
-    perfil = os.path.join(pasta, "perfil-lo")
-    cmd = [SOFFICE, f"-env:UserInstallation=file://{perfil}", "--headless", "--norestore", "--nolockcheck",
-           "--convert-to", "pdf", "--outdir", pasta, entrada]
+# O LibreOffice às vezes trava ao iniciar (raro, mas acontece). Cada tentativa tem prazo próprio;
+# se travar, o grupo de processos inteiro é encerrado (inclusive o soffice.bin, que antes podia
+# ficar vivo segurando a vez dos próximos pedidos) e há uma segunda tentativa, com perfil novo.
+PRAZO_LO_TENTATIVA = int(os.environ.get("PRAZO_LO_TENTATIVA_SEGUNDOS", "50"))
+
+
+def _rodar_libreoffice(pasta: str, args: list, demorou: str) -> int:
+    inicio = time.monotonic()
     with TRAVA_LO:
-        try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PRAZO, env={**os.environ, "HOME": pasta})
-        except subprocess.TimeoutExpired:
-            raise Problema(504, "demorou", "A conversão excedeu o tempo limite. Tente um arquivo menor.")
+        for tentativa in (1, 2):
+            resta = PRAZO - (time.monotonic() - inicio)
+            if resta < 5:
+                break
+            prazo = min(PRAZO_LO_TENTATIVA, resta) if tentativa == 1 else resta
+            perfil = os.path.join(pasta, f"perfil-lo-{tentativa}")
+            cmd = [SOFFICE, f"-env:UserInstallation=file://{perfil}", "--headless", "--norestore", "--nolockcheck", *args]
+            try:
+                return _rodar_com_prazo(cmd, prazo, env={**os.environ, "HOME": pasta}, limitar=False)
+            except subprocess.TimeoutExpired:
+                registrar(evento="libreoffice-travou", tentativa=tentativa, s=round(time.monotonic() - inicio, 1))
+    raise Problema(504, "demorou", demorou)
+
+
+def office_para_pdf(pasta: str, entrada: str) -> str:
+    codigo = _rodar_libreoffice(pasta, ["--convert-to", "pdf", "--outdir", pasta, entrada], "A conversão excedeu o tempo limite. Tente um arquivo menor.")
     saida = os.path.splitext(entrada)[0] + ".pdf"
-    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
+    if codigo != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
         raise Problema(422, "nao-converteu", "Não foi possível converter este arquivo. Ele pode estar danificado ou protegido por senha.")
     return saida
 
@@ -293,17 +312,11 @@ def pdf_para_pptx(pasta: str, entrada: str) -> str:
     """PDF -> PowerPoint pelo LibreOffice (Impress): cada página vira um slide, com o texto em
     caixas editáveis e os desenhos e imagens no lugar."""
     _conferir_pdf(entrada)
-    perfil = os.path.join(pasta, "perfil-lo")
     destino = os.path.join(pasta, "pptx")
-    cmd = [SOFFICE, f"-env:UserInstallation=file://{perfil}", "--headless", "--norestore", "--nolockcheck",
-           "--infilter=impress_pdf_import", "--convert-to", "pptx", "--outdir", destino, entrada]
-    with TRAVA_LO:
-        try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PRAZO, env={**os.environ, "HOME": pasta})
-        except subprocess.TimeoutExpired:
-            raise Problema(504, "demorou", "A conversão excedeu o tempo limite. Divida o PDF em partes menores com o Dividir PDF.")
+    codigo = _rodar_libreoffice(pasta, ["--infilter=impress_pdf_import", "--convert-to", "pptx", "--outdir", destino, entrada],
+                                "A conversão excedeu o tempo limite. Divida o PDF em partes menores com o Dividir PDF.")
     saida = os.path.join(destino, os.path.splitext(os.path.basename(entrada))[0] + ".pptx")
-    if r.returncode != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
+    if codigo != 0 or not os.path.exists(saida) or os.path.getsize(saida) == 0:
         raise Problema(422, "nao-converteu", "Não foi possível converter este PDF em PowerPoint. O arquivo pode estar danificado.")
     return saida
 
@@ -384,7 +397,64 @@ PDFA_DEF = """%!
 """
 
 
-def converter(dados: bytes, para: str, nome_ext: str, nivel: str = "2"):
+# ---------- Compressão máxima (1.3.0) ----------
+# O Comprimir PDF do site roda no aparelho, mas não mexe em imagens CMYK (gráfica), JPEG 2000,
+# paleta e afins. O Ghostscript regrava tudo: converte para RGB, reduz a resolução das imagens,
+# grava em JPEG (forçado: no automático ele às vezes escolhe sem perda e o arquivo cresce),
+# junta imagens repetidas e comprime as fontes.
+# Cada degrau: (dpi das imagens, QFactor do JPEG: maior = mais compressão).
+DEGRAUS_COMPRESSAO = [(150, 0.4), (150, 0.76), (110, 0.76), (85, 0.76), (72, 1.0), (50, 1.3)]
+NIVEIS_COMPRESSAO = {"equilibrado": [(150, 0.4)], "forte": [(110, 0.76)]}
+PRAZO_COMPRIMIR = int(os.environ.get("PRAZO_COMPRIMIR_SEGUNDOS", "60"))   # para todas as tentativas juntas
+
+
+def _comprimir_uma(entrada: str, saida: str, dpi: int, q: float, prazo: float) -> bool:
+    dic = f"<< /QFactor {q} /Blend 1 /HSamples [2 1 1 2] /VSamples [2 1 1 2] >>"
+    cmd = [GS, "-q", "-dBATCH", "-dNOPAUSE", "-dSAFER", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.6",
+           "-dDetectDuplicateImages=true", "-dCompressFonts=true", "-dSubsetFonts=true", "-sColorConversionStrategy=RGB",
+           "-dDownsampleColorImages=true", "-dDownsampleGrayImages=true",
+           "-dColorImageDownsampleType=/Bicubic", "-dGrayImageDownsampleType=/Bicubic",
+           f"-dColorImageResolution={dpi}", f"-dGrayImageResolution={dpi}",
+           "-dColorImageDownsampleThreshold=1.0", "-dGrayImageDownsampleThreshold=1.0",
+           "-dAutoFilterColorImages=false", "-dColorImageFilter=/DCTEncode",
+           "-dAutoFilterGrayImages=false", "-dGrayImageFilter=/DCTEncode",
+           "-dAutoRotatePages=/None", f"-sOutputFile={saida}",
+           "-c", f"<< /ColorImageDict {dic} /GrayImageDict {dic} >> setdistillerparams", "-f", entrada]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=max(5, prazo))
+    except subprocess.TimeoutExpired:
+        return False
+    return r.returncode == 0 and os.path.exists(saida) and os.path.getsize(saida) > 0
+
+
+def pdf_comprimir(pasta: str, entrada: str, nivel: str, alvo: int):
+    """Comprime com o Ghostscript. Com alvo (bytes), aperta degrau a degrau até caber ou até o
+    prazo acabar. Devolve (caminho, modo): modo "comprimido-<dpi>" (+ "-alcancou" quando cabe no
+    alvo) ou "sem-ganho" (o original já era menor: devolve o original)."""
+    _conferir_pdf(entrada)
+    original = os.path.getsize(entrada)
+    degraus = DEGRAUS_COMPRESSAO if alvo else NIVEIS_COMPRESSAO.get(nivel, NIVEIS_COMPRESSAO["equilibrado"])
+    inicio, melhor = time.monotonic(), None
+    for i, (dpi, q) in enumerate(degraus):
+        resta = PRAZO_COMPRIMIR - (time.monotonic() - inicio)
+        if resta <= 3:
+            break
+        saida = os.path.join(pasta, f"comprimido-{i}.pdf")
+        if not _comprimir_uma(entrada, saida, dpi, q, resta):
+            if melhor is None and i == 0:
+                raise Problema(422, "nao-converteu", "Não foi possível comprimir este PDF. O arquivo pode estar danificado.")
+            break
+        tam = os.path.getsize(saida)
+        if melhor is None or tam < melhor[1]:
+            melhor = (saida, tam, dpi)
+        if alvo and tam <= alvo:
+            break
+    if melhor is None or melhor[1] >= original:
+        return entrada, "sem-ganho"
+    return melhor[0], f"comprimido-{melhor[2]}" + ("-alcancou" if alvo and melhor[1] <= alvo else "")
+
+
+def converter(dados: bytes, para: str, nome_ext: str, nivel: str = "2", alvo: int = 0):
     tipo = tipo_de(dados)
     pasta = tempfile.mkdtemp(prefix="cm-")
     try:
@@ -413,6 +483,10 @@ def converter(dados: bytes, para: str, nome_ext: str, nivel: str = "2"):
             nivel = nivel if nivel in ("1", "2", "3") else "2"
             caminho, viraram_imagem = pdf_para_pdfa(pasta, entrada, nivel)
             modo = "pdfa-" + nivel + (f"-imagem-{viraram_imagem}" if viraram_imagem else "")
+        elif para == "comprimir":
+            if tipo != "pdf":
+                raise Problema(415, "tipo", "Para comprimir, envie um PDF.")
+            caminho, modo = pdf_comprimir(pasta, entrada, nivel, alvo)
         elif para == "pdf":
             if tipo in ("pdf", "desconhecido"):
                 raise Problema(415, "tipo", "Envie um arquivo do Word, Excel, PowerPoint ou OpenDocument.")
@@ -469,6 +543,8 @@ class Pedido(BaseHTTPRequestHandler):
         ext = (q.get("ext") or [""])[0].lower()
         nome_ext = ext if ext.startswith(".") and len(ext) <= 6 else ""
         nivel = (q.get("nivel") or ["2"])[0]
+        alvo_txt = (q.get("alvo") or ["0"])[0]
+        alvo = int(alvo_txt) if alvo_txt.isdigit() and len(alvo_txt) <= 10 else 0
         try:
             tamanho = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -479,7 +555,7 @@ class Pedido(BaseHTTPRequestHandler):
             return self.erro(Problema(413, "grande", f"Arquivo grande demais. O limite é {int(MAX_MB)} MB."))
         dados = self.rfile.read(tamanho)
         try:
-            saida, tipo, modo = converter(dados, para, nome_ext, nivel)
+            saida, tipo, modo = converter(dados, para, nome_ext, nivel, alvo)
         except Problema as p:
             registrar(evento="erro", para=para, codigo=p.codigo, mb=round(tamanho / 1048576, 1), s=round(time.time() - inicio, 1))
             return self.erro(p)

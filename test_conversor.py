@@ -133,6 +133,66 @@ class TesteConversor(unittest.TestCase):
         self.assertIn("1.234,56", tudo)
         self.assertTrue(d.tables, "a tabela continua tabela")
 
+    def test_word_antigo_doc_para_pdf(self):
+        """.doc (Word 97-2003): o LibreOffice abre o formato antigo e gera o PDF."""
+        import shutil, subprocess, tempfile, pymupdf
+        with tempfile.TemporaryDirectory() as t:
+            with open(os.path.join(t, "a.docx"), "wb") as f:
+                f.write(docx_exemplo())
+            subprocess.run([shutil.which("soffice") or "soffice", f"-env:UserInstallation=file://{t}/perfil", "--headless",
+                            "--convert-to", "doc", "--outdir", t, os.path.join(t, "a.docx")], check=True, capture_output=True, timeout=120)
+            with open(os.path.join(t, "a.doc"), "rb") as f:
+                doc = f.read()
+        self.assertEqual(doc[:4], bytes.fromhex("d0cf11e0"), "é um .doc de verdade (OLE)")
+        st, pdf, h = self.pedir(doc, "pdf", ext=".doc")
+        self.assertEqual(st, 200, pdf[:300])
+        with pymupdf.open(stream=pdf, filetype="pdf") as d:
+            self.assertIn("coração", "".join(p.get_text() for p in d))
+
+    def test_libreoffice_travado_e_encerrado_e_tenta_de_novo(self):
+        """Se o LibreOffice travar na 1ª tentativa, o grupo de processos inteiro (inclusive o filho que
+        ele abre) é encerrado e a 2ª tentativa converte. Simulado com um "soffice" que, na 1ª vez,
+        abre um filho e fica parado."""
+        import shutil, tempfile
+        real = shutil.which("soffice") or "soffice"
+        with tempfile.TemporaryDirectory() as t:
+            marca, filho = os.path.join(t, "ja-travou"), os.path.join(t, "filho.pid")
+            falso = os.path.join(t, "soffice")
+            with open(falso, "w") as f:
+                f.write(f"""#!/bin/sh
+if [ ! -e {marca} ]; then touch {marca}; sleep 300 & echo $! > {filho}; wait; fi
+exec {real} "$@"
+""")
+            os.chmod(falso, 0o755)
+            porta = porta_livre()
+            proc = subprocess.Popen([sys.executable, APP], env={**os.environ, "PORT": str(porta), "CHAVE": CHAVE, "SOFFICE": falso, "PRAZO_LO_TENTATIVA_SEGUNDOS": "4"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                for _ in range(100):
+                    try:
+                        urllib.request.urlopen(f"http://127.0.0.1:{porta}/saude", timeout=1); break
+                    except Exception:
+                        time.sleep(0.1)
+                inicio = time.time()
+                req = urllib.request.Request(f"http://127.0.0.1:{porta}/converter?para=pdf&ext=.docx", data=docx_exemplo(), method="POST", headers={"X-Chave": CHAVE})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(r.read()[:5], b"%PDF-")
+                self.assertGreater(time.time() - inicio, 3.5, "passou pela 1ª tentativa travada")
+                with open(filho) as f:
+                    pid = int(f.read().strip())
+                time.sleep(0.3)
+                # encerrado = não existe mais, ou ficou "zumbi" (Z) até o sistema recolher
+                try:
+                    with open(f"/proc/{pid}/stat") as f:
+                        estado = f.read().rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    estado = "X"
+                self.assertIn(estado, ("Z", "X"), f"o processo filho da tentativa travada foi encerrado (estado {estado})")
+            finally:
+                proc.terminate(); proc.wait(timeout=10)
+                log = proc.stdout.read().decode("utf8", "replace")
+            self.assertIn('"libreoffice-travou"', log)
+
     def test_plano_b_quando_a_detalhada_nao_termina(self):
         """Com prazo de 0 segundo a conversão detalhada "trava": tem de sair a "no lugar", com texto, negrito e imagem."""
         import pymupdf
@@ -307,6 +367,125 @@ class TesteConversor(unittest.TestCase):
         titulos = ["Faltas no período", "Dias gozados", "Dias de direito"] + meses
         for k, t in enumerate(titulos):
             self.assertEqual(numeros[k], col[t], f"números de {t!r} na coluna do título")
+
+    def _apresentacao(self):
+        import pymupdf
+        d = pymupdf.open()
+        for i in range(3):
+            p = d.new_page(width=842, height=595)
+            p.insert_text((60, 80), f"Apresentação inventada, slide {i + 1}", fontsize=28)
+            p.insert_text((60, 140), "Tópico com acentuação: ação e coração", fontsize=18)
+            p.draw_rect(pymupdf.Rect(500, 250, 780, 500), color=(0.2, 0.4, 0.8), fill=(0.85, 0.9, 1))
+        return d.tobytes()
+
+    def test_pdf_para_powerpoint(self):
+        """Cada página vira um slide, com o texto editável (caixas de texto) e o desenho."""
+        from pptx import Presentation
+        st, pptx, h = self.pedir(self._apresentacao(), "pptx")
+        self.assertEqual(st, 200, pptx[:300])
+        self.assertEqual(h["Content-Type"], "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        apr = Presentation(io.BytesIO(pptx))
+        self.assertEqual(len(apr.slides), 3)
+        textos = [sh.text_frame.text for sh in apr.slides[1].shapes if sh.has_text_frame]
+        self.assertTrue(any("slide 2" in t for t in textos), textos)
+        self.assertTrue(any("coração" in t for t in textos), textos)
+        self.assertGreater(apr.slide_width, apr.slide_height, "paisagem, como o PDF")
+
+    def test_pdf_para_pdfa(self):
+        """PDF/A-2b (padrão) e PDF/A-1b: identificação no XMP, perfil de cor (OutputIntent) e todas as fontes embutidas."""
+        import pikepdf, pymupdf
+        for nivel, esperado in (("2", "2B"), ("1", "1B")):
+            req = urllib.request.Request(f"http://127.0.0.1:{self.porta}/converter?para=pdfa&nivel={nivel}", data=self._apresentacao(), method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                self.assertEqual(r.headers["Content-Type"], "application/pdf")
+                self.assertEqual(r.headers["X-Modo"], "pdfa-" + nivel)
+                corpo = r.read()
+            with pikepdf.open(io.BytesIO(corpo)) as p:
+                self.assertEqual(p.open_metadata().pdfa_status, esperado)
+                self.assertIn("/OutputIntents", p.Root)
+                self.assertEqual(str(p.Root.OutputIntents[0].S), "/GTS_PDFA1")
+            with pymupdf.open(stream=corpo, filetype="pdf") as d:
+                self.assertEqual(d.page_count, 3)
+                fontes = {f[3]: f[1] for pg in d for f in pg.get_fonts(full=True)}
+                self.assertTrue(fontes and all(ext != "n/a" for ext in fontes.values()), f"fontes embutidas: {fontes}")
+                self.assertIn("coração", d[0].get_text())
+
+    def test_pdfa_tira_o_que_o_padrao_proibe(self):
+        """JavaScript e anexos saem; no PDF/A-1b, a página com transparência vira imagem e o servidor avisa."""
+        import pymupdf
+        d = pymupdf.open()
+        p = d.new_page()
+        p.insert_text((50, 50), "Página com transparência")
+        p.draw_rect(pymupdf.Rect(50, 150, 200, 250), fill=(1, 0, 0), fill_opacity=0.5)
+        d.new_page().insert_text((50, 50), "Página comum")
+        d.embfile_add("anexo.txt", b"conteudo inventado")
+        d.xref_set_key(d.pdf_catalog(), "OpenAction", "<< /S /JavaScript /JS (app.alert(1)) >>")
+        original = d.tobytes()
+        for nivel, modo in (("2", "pdfa-2"), ("1", "pdfa-1-imagem-1")):
+            req = urllib.request.Request(f"http://127.0.0.1:{self.porta}/converter?para=pdfa&nivel={nivel}", data=original, method="POST", headers={"X-Chave": CHAVE})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                self.assertEqual(r.headers["X-Modo"], modo)
+                corpo = r.read()
+            with pymupdf.open(stream=corpo, filetype="pdf") as o:
+                self.assertNotIn("JavaScript", o.xref_object(o.pdf_catalog()))
+                self.assertEqual(o.embfile_count(), 0)
+                self.assertIn("comum", o[1].get_text())
+
+    def _grafica(self):
+        """PDF inventado com imagem CMYK (de gráfica) e JPEG 2000: o que o Comprimir do aparelho não mexe."""
+        import numpy as np, pymupdf
+        from PIL import Image
+        rng = np.random.default_rng(7)
+        y, x = np.mgrid[0:1200, 0:1600]
+        base = np.stack([(np.sin(x / 97) + np.cos(y / 53)) * 60 + 128, (np.sin(y / 71) * np.cos(x / 41)) * 80 + 128, (x * y / (1600 * 1200)) * 200 + 20], -1)
+        im = Image.fromarray(np.clip(base + rng.normal(0, 18, base.shape), 0, 255).astype("uint8"))
+        cm, jp = io.BytesIO(), io.BytesIO()
+        im.convert("CMYK").save(cm, "JPEG", quality=92)
+        im.save(jp, "JPEG2000", quality_mode="rates", quality_layers=[8])
+        d = pymupdf.open()
+        for img in (cm.getvalue(), jp.getvalue()):
+            p = d.new_page(width=595, height=842)
+            p.insert_text((60, 60), "Pagina inventada com imagem de grafica", fontsize=14)
+            p.insert_image(pymupdf.Rect(40, 90, 555, 480), stream=img)
+        return d.tobytes()
+
+    def _comprimir(self, dados, consulta):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.porta}/converter?para=comprimir&{consulta}", data=dados, method="POST", headers={"X-Chave": CHAVE})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.read(), r.headers["X-Modo"], r.headers["Content-Type"]
+
+    def test_comprimir_maximo(self):
+        """CMYK e JPEG 2000 viram JPEG RGB menor; o texto continua; com alvo, aperta até caber."""
+        import pymupdf
+        original = self._grafica()
+        for consulta, dpi in (("nivel=equilibrado", 150), ("nivel=forte", 110)):
+            corpo, modo, tipo = self._comprimir(original, consulta)
+            self.assertEqual(tipo, "application/pdf")
+            self.assertEqual(modo, f"comprimido-{dpi}")
+            self.assertLess(len(corpo), len(original) / 8, f"{consulta}: {len(original)} -> {len(corpo)}")
+            with pymupdf.open(stream=corpo, filetype="pdf") as d:
+                self.assertEqual(d.page_count, 2)
+                self.assertIn("Pagina inventada", d[1].get_text())
+                imgs = [x for pg in d for x in pg.get_images(full=True)]
+                self.assertTrue(imgs and all(x[5] == "DeviceRGB" and x[8] == "DCTDecode" for x in imgs), imgs)
+        corpo, modo, _ = self._comprimir(original, "alvo=60000")
+        self.assertTrue(modo.endswith("-alcancou"), modo)
+        self.assertLessEqual(len(corpo), 60000)
+        # alvo impossível: devolve o menor que conseguiu, sem "-alcancou"
+        corpo, modo, _ = self._comprimir(original, "alvo=1000")
+        self.assertRegex(modo, r"^comprimido-50$")
+
+    def test_comprimir_sem_ganho_devolve_o_original(self):
+        """PDF só com texto, já pequeno: o servidor devolve o próprio arquivo."""
+        import pymupdf
+        d = pymupdf.open()
+        d.new_page().insert_text((50, 50), "Texto inventado")
+        original = d.tobytes(garbage=4, deflate=True)
+        corpo, modo, _ = self._comprimir(original, "nivel=forte")
+        if modo == "sem-ganho":
+            self.assertEqual(corpo, original)
+        else:
+            self.assertLess(len(corpo), len(original))
 
     def test_valores_brasileiros(self):
         sys.path.insert(0, os.path.join(AQUI, ".."))
